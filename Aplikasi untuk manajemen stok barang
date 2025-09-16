@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inventory Manager (Cloud-Sync)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@zxing/library@latest/umd/index.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-firestore-compat.js"></script>
+    
+    <style>
+        /* A little extra style for better font rendering */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useEffect, useMemo, useRef, useState, useCallback } = React;
+
+        /**
+         * Inventory Manager — single‑file React app
+         * Now with Firebase Firestore for cloud data sync.
+         */
+
+        // ---- Types (JSDoc) ----------------------------------------
+        /** @typedef {{ id:string, sku:string, name:string, description?:string, category:string, unit:string, price:number, stock:number, minStock:number, barcode?:string }} Product */
+        /** @typedef {{ id:string, date:string, productId:string, sku:string, name:string, type:'IN'|'OUT', qty:number, note:string, by?:'manual'|'scan' }} Tx */
+        /** @typedef {{ title: string, message: React.ReactNode, type?: 'alert'|'confirm', onConfirm: () => void, onCancel?: () => void, confirmText?: string, cancelText?: string }} ModalInfo */
+
+        // ---- Utils -------------------------------------------------
+        const uid = () => Math.random().toString(36).slice(2, 10);
+        const fmt = new Intl.NumberFormat("id-ID");
+        const money = (n) => new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", maximumFractionDigits: 0 }).format(n || 0);
+
+        // ---- Main App ---------------------------------------------
+        function App() {
+          const [tab, setTab] = useState("data"); // data | report | scan
+          const [products, setProducts] = useState([]);
+          const [txs, setTxs] = useState([]);
+          const [categories, setCategories] = useState(["Umum"]);
+
+          const [query, setQuery] = useState("");
+          const [catFilter, setCatFilter] = useState("ALL");
+          const [onlyLow, setOnlyLow] = useState(false);
+          const [editing, setEditing] = useState(null);
+          const [txModal, setTxModal] = useState(null);
+          const [scanDefault, setScanDefault] = useState('OUT');
+          const [modal, setModal] = useState(null);
+          const [newProductData, setNewProductData] = useState(null);
+          
+          const [userId, setUserId] = useState(null);
+          const [db, setDb] = useState(null);
+          const [isLoading, setIsLoading] = useState(true);
+          
+          const fileInputRef = useRef(null);
+
+          // --- Firebase Integration ---
+          useEffect(() => {
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+            if (!firebaseConfig) {
+                console.error("Firebase config not found.");
+                setIsLoading(false);
+                return;
+            }
+
+            const app = firebase.initializeApp(firebaseConfig);
+            const auth = firebase.auth();
+            const firestore = firebase.firestore();
+            setDb(firestore);
+
+            auth.onAuthStateChanged(user => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    auth.signInAnonymously().catch(error => console.error("Anonymous sign-in failed:", error));
+                }
+            });
+          }, []);
+
+          const saveData = useCallback(async (dataToSave) => {
+            if (!db || !userId) return;
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const userDocRef = db.collection('artifacts').doc(appId).collection('users').doc(userId);
+            try {
+                await userDocRef.set(dataToSave, { merge: true });
+            } catch (error) {
+                console.error("Failed to save data:", error);
+                setModal({ title: "Error", message: "Gagal menyimpan data ke cloud." });
+            }
+          }, [db, userId]);
+
+          // Effect for loading data from Firestore
+          useEffect(() => {
+            if (!db || !userId) return;
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const userDocRef = db.collection('artifacts').doc(appId).collection('users').doc(userId);
+            
+            const unsubscribe = userDocRef.onSnapshot((docSnap) => {
+                if (docSnap.exists) {
+                    const data = docSnap.data();
+                    setProducts(data.products || []);
+                    setTxs(data.transactions || []);
+                    setCategories(data.categories || ["Umum"]);
+                } else {
+                    // Initialize data for new user
+                    saveData({ products: [], transactions: [], categories: ["Umum"] });
+                }
+                setIsLoading(false);
+            }, (error) => {
+                console.error("Error listening to document:", error);
+                setIsLoading(false);
+                setModal({ title: "Error", message: "Gagal memuat data dari cloud." });
+            });
+
+            return () => unsubscribe(); // Cleanup listener on component unmount
+          }, [db, userId, saveData]);
+
+          // --- Data Persistence to Firestore ---
+          const isInitialMount = useRef(true);
+          useEffect(() => {
+              if (!isLoading && !isInitialMount.current) {
+                  saveData({ products, transactions: txs, categories });
+              } else {
+                  isInitialMount.current = false;
+              }
+          }, [products, txs, categories, isLoading, saveData]);
+          
+          
+          // Derived lists
+          const catOptions = useMemo(() => ["ALL", ...Array.from(new Set([...categories, ...products.map(p=>p.category).filter(Boolean)]))], [categories, products]);
+
+          const filtered = useMemo(() => {
+            const q = query.trim().toLowerCase();
+            return products.filter(p => {
+              if (catFilter !== "ALL" && p.category !== catFilter) return false;
+              if (onlyLow && !(p.stock <= (p.minStock||0))) return false;
+              if (!q) return true;
+              return [p.sku, p.name, p.category, p.barcode].some(x => (x||"").toLowerCase().includes(q));
+            });
+          }, [products, query, catFilter, onlyLow]);
+
+          // CRUD ops
+          function upsertProduct(prod) {
+            setProducts(prev => {
+              const exists = prev.some(p => p.id === prod.id);
+              const next = exists ? prev.map(p => p.id === prod.id ? prod : p) : [...prev, prod];
+              return next.sort((a,b)=>a.name.localeCompare(b.name));
+            });
+          }
+          function deleteProduct(product) {
+            setModal({
+                type: 'confirm',
+                title: 'Hapus Produk?',
+                message: `Anda yakin ingin menghapus "${product.name}"? Semua riwayat transaksi terkait juga akan dihapus.`,
+                confirmText: 'Ya, Hapus',
+                onConfirm: () => {
+                    setProducts(prev => prev.filter(p => p.id !== product.id));
+                    setTxs(prev => prev.filter(t => t.productId !== product.id));
+                    setModal(null);
+                }
+            });
+          }
+
+          // Transactions
+          function doTx(product, type, qty, note="", by/** @type {Tx['by']} */='manual') {
+            const q = Number(qty||0);
+            if (!q || q <= 0) {
+                setModal({ title: 'Input Tidak Valid', message: 'Kuantitas harus lebih besar dari 0.' });
+                return;
+            }
+
+            setProducts(prev => prev.map(p => {
+              if (p.id !== product.id) return p;
+              const delta = type === 'IN' ? q : -q;
+              const newStock = Math.max(0, (p.stock||0) + delta);
+              return { ...p, stock: newStock };
+            }));
+
+            const rec = /** @type {Tx} */ ({
+              id: uid(),
+              date: new Date().toISOString(),
+              productId: product.id,
+              sku: product.sku,
+              name: product.name,
+              type,
+              qty: q,
+              note,
+              by,
+            });
+            setTxs(prev => [rec, ...prev]);
+            setTxModal(null);
+          }
+
+          // Import / Export
+          function handleImportClick() {
+            fileInputRef.current.click();
+          }
+          
+          async function importJSON(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+          
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              try {
+                const data = JSON.parse(e.target.result);
+                if (!Array.isArray(data.products) || !Array.isArray(data.transactions) || !Array.isArray(data.categories)) {
+                  throw new Error("Struktur file JSON tidak valid.");
+                }
+                setModal({
+                  type: 'confirm',
+                  title: 'Impor Data?',
+                  message: 'Ini akan menimpa semua data yang ada saat ini. Anda yakin ingin melanjutkan?',
+                  confirmText: 'Ya, Impor & Timpa',
+                  onConfirm: () => {
+                    setProducts(data.products || []);
+                    setTxs(data.transactions || []);
+                    setCategories(data.categories || ["Umum"]);
+                    setModal({ title: 'Sukses', message: 'Data berhasil diimpor.' });
+                  }
+                });
+              } catch (error) {
+                setModal({ title: 'Gagal Impor', message: `Terjadi kesalahan: ${error.message}` });
+              } finally {
+                event.target.value = null;
+              }
+            };
+            reader.readAsText(file);
+          }
+
+          function exportJSON() {
+            const payload = { products, transactions: txs, categories };
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url; a.download = `inventory-backup-${new Date().toISOString().slice(0,10)}.json`; a.click();
+            URL.revokeObjectURL(url);
+          }
+
+          function exportProductsCSV() {
+            const headers = ["sku","name","description","category","unit","price","stock","minStock","barcode"];
+            const rows = products.map(p => [p.sku, p.name, p.description||"", p.category, p.unit, p.price, p.stock, p.minStock, p.barcode||""]);
+            const csv = [headers.join(","), ...rows.map(r=>r.map(v => `"${String(v??"").replaceAll('"','""')}"`).join(","))].join("\n");
+            downloadBlob(csv, `products-${Date.now()}.csv`, 'text/csv;charset=utf-8;');
+          }
+
+          function exportTxCSV(rangeLabel, txList){
+            const headers = ["date","type","sku","name","qty","note","by"];
+            const rows = txList.map(t=>[new Date(t.date).toLocaleString('id-ID'), t.type, t.sku, t.name, t.qty, t.note, t.by||'manual']);
+            const csv = [headers.join(","), ...rows.map(r=>r.map(v => `"${String(v??"").replaceAll('"','""')}"`).join(","))].join("\n");
+            downloadBlob(csv, `transactions-${rangeLabel}-${Date.now()}.csv`, 'text/csv;charset=utf-8;');
+          }
+
+          function downloadBlob(content, filename, type){
+            const blob = new Blob([content], { type });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url; a.download = filename; a.click();
+            URL.revokeObjectURL(url);
+          }
+
+          function productByBarcode(code){
+            return products.find(p => (p.barcode||"") === String(code||""));
+          }
+
+          async function lookupAndFillForm(barcode) {
+            setModal({ title: 'Mencari Info Produk...', message: 'Menghubungi database barcode publik...', type: 'alert', onConfirm: () => {} });
+            try {
+                const response = await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}?fields=product_name`);
+                if (!response.ok) throw new Error('Gagal menghubungi database produk (status: ' + response.status + ').');
+                
+                const data = await response.json();
+                if (data.status !== 1 || !data.product || !data.product.product_name) {
+                    throw new Error(`Barcode "${barcode}" tidak ditemukan di database publik.`);
+                }
+                
+                const productName = data.product.product_name;
+                
+                setNewProductData({
+                    barcode: barcode,
+                    name: productName,
+                    description: '',
+                    sku: 'AUTO-' + barcode,
+                });
+                setTab('data');
+                setModal(null);
+
+            } catch (error) {
+                setModal({ title: 'Gagal', message: error.message, type: 'alert' });
+            }
+          }
+
+          if (isLoading) {
+              return <div className="min-h-screen w-full grid place-content-center text-slate-500">Memuat data dari cloud...</div>
+          }
+
+          return (
+            <div className="min-h-screen w-full bg-slate-50 text-slate-900">
+              <input type="file" ref={fileInputRef} onChange={importJSON} className="hidden" accept="application/json" />
+
+              <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-slate-200">
+                <div className="mx-auto max-w-7xl px-4 py-4 flex items-center gap-3">
+                  <div className="size-9 rounded-2xl bg-slate-900 text-white grid place-content-center font-bold">IM</div>
+                  <div>
+                    <h1 className="text-xl font-bold leading-tight">Inventory Manager</h1>
+                    <p className="text-xs text-slate-500">Manajemen stok sederhana — Cloud Sync Aktif</p>
+                  </div>
+
+                  <nav className="ml-auto flex items-center gap-1">
+                    <TabButton current={tab} id="data" onClick={()=>setTab('data')}>Data</TabButton>
+                    <TabButton current={tab} id="scan" onClick={()=>setTab('scan')}>Scan</TabButton>
+                    <TabButton current={tab} id="report" onClick={()=>setTab('report')}>Laporan</TabButton>
+                  </nav>
+
+                  <div className="hidden md:flex items-center gap-2 ml-2">
+                    <button onClick={handleImportClick} className="px-3 py-2 text-sm rounded-xl bg-white border border-slate-300 hover:bg-slate-100">Impor JSON</button>
+                    <button onClick={exportJSON} className="px-3 py-2 text-sm rounded-xl bg-slate-900 text-white hover:opacity-90">Ekspor JSON</button>
+                  </div>
+                </div>
+              </header>
+
+              {tab === 'data' && (
+                <main className="mx-auto max-w-7xl px-4 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  {/* Left: Product form */}
+                  <section className="lg:col-span-1">
+                    <Card>
+                      <CardHeader title={editing ? "Edit Produk" : "Tambah Produk"} subtitle="Lengkapi detail produk" />
+                      <div className="p-4">
+                        <ProductForm
+                          key={editing || (newProductData ? `new-${newProductData.barcode}` : 'new')}
+                          product={products.find(p=>p.id===editing) || null}
+                            categories={catOptions.filter(c => c !== 'ALL')}
+                          onCancel={()=>setEditing(null)}
+                          onSubmit={(p)=>{ upsertProduct(p); setEditing(null); }}
+                          onAddCategory={(c)=>{ if (!categories.includes(c)) setCategories([...categories, c]); }}
+                            setModal={setModal}
+                            initialData={newProductData}
+                            onDataLoaded={() => setNewProductData(null)}
+                            onLookupBarcode={lookupAndFillForm}
+                        />
+                      </div>
+                    </Card>
+
+                    <Card className="mt-6">
+                      <CardHeader title="Ringkasan" subtitle="Statistik cepat" />
+                      <div className="p-4 grid grid-cols-2 gap-4">
+                        <Stat label="Total SKU" value={fmt.format(products.length)} />
+                        <Stat label="Nilai Stok (≈)" value={money(products.reduce((s,p)=>s+(p.price||0)*(p.stock||0),0))} />
+                        <Stat label="Item Low Stock" value={fmt.format(products.filter(p=>p.stock<=p.minStock).length)} />
+                        <Stat label="Transaksi" value={fmt.format(txs.length)} />
+                      </div>
+                    </Card>
+                  </section>
+
+                  {/* Right: List & history */}
+                  <section className="lg:col-span-2">
+                    <Card>
+                      <div className="p-4 flex flex-col sm:flex-row gap-3 sm:items-center">
+                        <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Cari SKU/Nama/Kategori/Barcode..." className="w-full sm:flex-1 px-3 py-2 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400" />
+                        <select value={catFilter} onChange={e=>setCatFilter(e.target.value)} className="px-3 py-2 rounded-xl border border-slate-300">
+                          {catOptions.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                        <label className="inline-flex items-center gap-2 text-sm whitespace-nowrap">
+                          <input type="checkbox" checked={onlyLow} onChange={e=>setOnlyLow(e.target.checked)} />
+                          Tampilkan low stock
+                        </label>
+                      </div>
+
+                      <div className="px-4 pb-4 overflow-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-left text-slate-500">
+                              <th className="p-2">SKU</th>
+                              <th className="p-2">Nama</th>
+                              <th className="p-2">Kategori</th>
+                              <th className="p-2 text-right">Harga</th>
+                              <th className="p-2 text-right">Stok</th>
+                              <th className="p-2 text-right">Min</th>
+                              <th className="p-2 text-center">Aksi</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filtered.length === 0 && (
+                              <tr><td colSpan={7} className="py-8 text-center text-slate-500">Belum ada data / tidak ditemukan</td></tr>
+                            )}
+                            {filtered.map(p => (
+                              <tr key={p.id} className={`border-t border-slate-100 ${p.stock<=p.minStock ? 'bg-red-50/40' : ''}`}>
+                                <td className="p-2 font-mono">{p.sku}</td>
+                                <td className="p-2">
+                                  <div className="flex items-center gap-2">
+                                    <span title={p.description}>{p.name}</span>
+                                    {p.barcode && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200">barcode</span>}
+                                  </div>
+                                </td>
+                                <td className="p-2">{p.category}</td>
+                                <td className="p-2 text-right">{money(p.price)}</td>
+                                <td className="p-2 text-right font-medium">{fmt.format(p.stock||0)}</td>
+                                <td className="p-2 text-right">{fmt.format(p.minStock||0)}</td>
+                                <td className="p-2">
+                                  <div className="flex justify-center gap-1">
+                                    <button title="Stock In" onClick={()=>setTxModal({product:p, type:'IN', origin:'manual'})} className="px-2 py-1 rounded-lg bg-emerald-600 text-white text-xs">IN</button>
+                                    <button title="Stock Out" onClick={()=>setTxModal({product:p, type:'OUT', origin:'manual'})} className="px-2 py-1 rounded-lg bg-amber-600 text-white text-xs">OUT</button>
+                                    <button onClick={()=>setEditing(p.id)} className="px-2 py-1 rounded-lg bg-white border border-slate-300 text-xs">Edit</button>
+                                    <button onClick={()=>deleteProduct(p)} className="px-2 py-1 rounded-lg bg-white border border-red-300 text-red-600 text-xs">Hapus</button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </Card>
+
+                    <Card className="mt-6">
+                      <CardHeader title="Riwayat Transaksi" subtitle="Menampilkan 10 transaksi terakhir" />
+                      <div className="p-4 overflow-auto">
+                        <div className="flex items-center gap-2 mb-3">
+                          <button onClick={()=>exportTxCSV('all', txs)} className="px-3 py-2 text-sm rounded-xl bg-white border border-slate-300 hover:bg-slate-100">Ekspor Semua Transaksi (CSV)</button>
+                        </div>
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-left text-slate-500">
+                              <th className="p-2">Waktu</th>
+                              <th className="p-2">SKU</th>
+                              <th className="p-2">Nama</th>
+                              <th className="p-2">Jenis</th>
+                              <th className="p-2 text-right">Qty</th>
+                              <th className="p-2">Sumber</th>
+                              <th className="p-2">Catatan</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {txs.length === 0 && (
+                              <tr><td colSpan={7} className="py-8 text-center text-slate-500">Belum ada transaksi</td></tr>
+                            )}
+                            {txs.slice(0, 10).map(t => (
+                              <tr key={t.id} className="border-t border-slate-100">
+                                <td className="p-2 text-slate-500">{new Date(t.date).toLocaleString('id-ID')}</td>
+                                <td className="p-2 font-mono">{t.sku}</td>
+                                <td className="p-2">{t.name}</td>
+                                <td className={`p-2 font-medium ${t.type==='IN' ? 'text-emerald-700' : 'text-amber-700'}`}>{t.type}</td>
+                                <td className="p-2 text-right font-medium">{fmt.format(t.qty)}</td>
+                                <td className="p-2 text-slate-500">{t.by||'manual'}</td>
+                                <td className="p-2 max-w-[28ch] truncate" title={t.note}>{t.note}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </Card>
+                  </section>
+                </main>
+              )}
+
+              {tab === 'scan' && (
+                <main className="mx-auto max-w-4xl px-4 py-6 grid gap-6">
+                  <Card>
+                    <CardHeader title="Scan Barcode / QR" subtitle="Gunakan kamera atau unggah gambar untuk memindai barcode." />
+                    <div className="p-4 grid gap-4">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm text-slate-500">Default aksi:</span>
+                        <ToggleGroup value={scanDefault} onChange={setScanDefault} />
+                      </div>
+                      <BarcodeScanner
+                        onDetect={(code)=>{
+                            const existingProduct = productByBarcode(code);
+                            if (existingProduct) {
+                                setTxModal({ product: existingProduct, type: scanDefault, origin: 'scan' });
+                            } else {
+                                setModal({
+                                    type: 'confirm',
+                                    title: 'Produk Baru Terdeteksi',
+                                    message: `Barcode "${code}" tidak ditemukan. Tambahkan sebagai produk baru?`,
+                                    confirmText: 'Ya, Tambahkan',
+                                    onConfirm: () => {
+                                        setNewProductData({
+                                            barcode: code,
+                                            name: '',
+                                            description: '',
+                                            sku: 'AUTO-' + code,
+                                        });
+                                        setTab('data');
+                                        setModal(null);
+                                    }
+                                });
+                            }
+                        }}
+                      />
+                      <ManualScan onSubmit={(val)=>{
+                        const prod = productByBarcode(val);
+                        if (!prod) {
+                                setModal({ title: 'Tidak Ditemukan', message: `Barcode tidak dikenali: ${val}` });
+                                return;
+                            }
+                        setTxModal({ product: prod, type: scanDefault, origin: 'scan' });
+                      }} />
+                      <p className="text-xs text-slate-500">Tip: Set barcode di form produk. Bisa pakai EAN/UPC atau string QR custom.</p>
+                    </div>
+                  </Card>
+                </main>
+              )}
+
+              {tab === 'report' && (
+                <main className="mx-auto max-w-6xl px-4 py-6 grid gap-6">
+                  <ReportCard txs={txs} products={products} onExport={exportTxCSV} />
+                </main>
+              )}
+
+              {txModal && (
+                <TxModal
+                  product={txModal.product}
+                  type={txModal.type}
+                  onClose={()=>setTxModal(null)}
+                  onSubmit={(qty, note)=>doTx(txModal.product, txModal.type, qty, note, txModal.origin==='scan'?'scan':'manual')}
+                />
+              )}
+
+            {modal && (
+                <Modal
+                    title={modal.title}
+                    type={modal.type || 'alert'}
+                    onConfirm={modal.onConfirm || (() => setModal(null))}
+                    onCancel={modal.onCancel || (() => setModal(null))}
+                    confirmText={modal.confirmText}
+                    cancelText={modal.cancelText}
+                >
+                    {modal.message}
+                </Modal>
+            )}
+
+              <footer className="py-8 text-center text-xs text-slate-400">
+                {userId && <p>User ID: <span className="font-mono bg-slate-200 px-1 py-0.5 rounded">{userId}</span></p>}
+                Built with ❤️ — data tersimpan di browser Anda
+              </footer>
+            </div>
+          );
+        }
+
+        // ---- UI Bits ------------------------------------------------
+        function Card({ children, className="" }){
+          return <div className={`rounded-2xl bg-white border border-slate-200 shadow-sm ${className}`}>{children}</div>;
+        }
+        function CardHeader({ title, subtitle }){
+          return (
+            <div className="px-4 pt-4">
+              <h2 className="text-lg font-semibold leading-tight">{title}</h2>
+              {subtitle && <p className="text-xs text-slate-500">{subtitle}</p>}
+            </div>
+          );
+        }
+        function Stat({ label, value }){
+          return (
+            <div className="rounded-xl border border-slate-200 p-4">
+              <div className="text-sm text-slate-500">{label}</div>
+              <div className="text-xl font-semibold">{value}</div>
+            </div>
+          );
+        }
+        function TabButton({ current, id, onClick, children }){
+          const active = current===id; 
+          return (
+            <button onClick={onClick} className={`px-3 py-2 text-sm rounded-xl border ${active? 'bg-slate-900 text-white border-slate-900' : 'bg-white border-slate-300 hover:bg-slate-100'}`}>{children}</button>
+          );
+        }
+
+        function ProductForm({ product, categories, onSubmit, onCancel, onAddCategory, setModal, initialData, onDataLoaded }){
+          const [sku, setSku] = useState(product?.sku || initialData?.sku || "");
+          const [name, setName] = useState(product?.name || initialData?.name || "");
+          const [description, setDescription] = useState(product?.description || initialData?.description || "");
+          const [category, setCategory] = useState(product?.category || initialData?.category || "Umum");
+          const [unit, setUnit] = useState(product?.unit || initialData?.unit || "pcs");
+          const [price, setPrice] = useState(product?.price ?? (initialData?.price ?? ""));
+          const [stock, setStock] = useState(product?.stock ?? (initialData?.stock ?? ""));
+          const [minStock, setMinStock] = useState(product?.minStock ?? (initialData?.minStock ?? ""));
+          const [barcode, setBarcode] = useState(product?.barcode || initialData?.barcode || "");
+          
+          useEffect(() => {
+            if (initialData) {
+                if (onDataLoaded) onDataLoaded();
+            }
+          }, []);
+
+
+          function submit(e){
+            e.preventDefault();
+            if (!sku || !name) {
+                setModal({ title: 'Input Tidak Lengkap', message: 'SKU dan Nama produk wajib diisi.' });
+                return;
+            }
+            const prod = /** @type {Product} */ ({
+              id: product?.id || uid(),
+              sku: sku.trim(),
+              name: name.trim(),
+              description: description.trim() || undefined,
+              category: category.trim() || "Umum",
+              unit: unit.trim() || "pcs",
+              price: Number(price||0),
+              stock: Number(stock||0),
+              minStock: Number(minStock||0),
+              barcode: barcode.trim() || undefined,
+            });
+            onSubmit(prod);
+            // reset if new
+            if (!product) {
+              setSku(""); setName(""); setCategory("Umum"); setUnit("pcs"); setPrice(""); setStock(""); setMinStock(""); setBarcode(""); setDescription("");
+            }
+          }
+
+          return (
+            <form onSubmit={submit} className="grid grid-cols-2 gap-4">
+              <Field label="SKU *" className="col-span-2 sm:col-span-1">
+                <input value={sku} onChange={e=>setSku(e.target.value)} className="inp" placeholder="BRG-001" required/>
+              </Field>
+              <Field label="Nama *" className="col-span-2 sm:col-span-1">
+                <input value={name} onChange={e=>setName(e.target.value)} className="inp" placeholder="Nama produk" required/>
+              </Field>
+              <Field label="Kategori" className="col-span-2">
+                <input list="categories-list" value={category} onChange={e=>setCategory(e.target.value)} className="inp" />
+                <datalist id="categories-list">
+                    {categories.map(c => <option key={c} value={c} />)}
+                </datalist>
+              </Field>
+              <Field label="Deskripsi" className="col-span-2">
+                <textarea value={description} onChange={e=>setDescription(e.target.value)} rows={3} className="inp" placeholder="Deskripsi singkat produk..."></textarea>
+              </Field>
+              <Field label="Satuan" className="col-span-2 sm:col-span-1">
+                <input value={unit} onChange={e=>setUnit(e.target.value)} className="inp" placeholder="pcs, pack, box" />
+              </Field>
+              <Field label="Harga (Rp)" className="col-span-2 sm:col-span-1">
+                <input type="number" min={0} value={price} onChange={e=>setPrice(e.target.value)} className="inp" placeholder="0" />
+              </Field>
+              <Field label="Stok Awal" className="col-span-2 sm:col-span-1">
+                <input type="number" min={0} value={stock} onChange={e=>setStock(e.target.value)} className="inp" placeholder="0" />
+              </Field>
+              <Field label="Min Stok (Alert)" className="col-span-2 sm:col-span-1">
+                <input type="number" min={0} value={minStock} onChange={e=>setMinStock(e.target.value)} className="inp" placeholder="0" />
+              </Field>
+              <Field label="Barcode (opsional)" className="col-span-2">
+                <div className="flex gap-2">
+                  <input value={barcode} onChange={e=>setBarcode(e.target.value)} className="inp flex-1" placeholder="EAN/UPC/QR text" />
+                  <SmallScanButton 
+                      onValue={(code) => { setBarcode(code); }}
+                  />
+                </div>
+              </Field>
+
+              <div className="col-span-2 flex justify-between items-center pt-2">
+                {product ? (
+                  <button type="button" onClick={onCancel} className="px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">Batal</button>
+                ) : <div />}
+                <button type="submit" className="px-4 py-2 rounded-xl bg-slate-900 text-white hover:opacity-90">{product? 'Simpan Perubahan' : 'Tambah Produk'}</button>
+              </div>
+            </form>
+          );
+        }
+
+        function Field({ label, children, className="" }){
+          return (
+            <label className={`text-sm ${className}`}>
+              <div className="mb-1 text-slate-500">{label}</div>
+              {children}
+              <style>{`.inp{ @apply w-full px-3 py-2 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400; }`}</style>
+            </label>
+          );
+        }
+
+        function TxModal({ product, type, onClose, onSubmit }){
+          const [qty, setQty] = useState(1);
+          const [note, setNote] = useState("");
+          const ref = useRef(null);
+          useEffect(()=>{ ref.current?.focus(); },[]);
+
+          return (
+            <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-20 grid place-content-center p-4">
+              <div className="w-[min(96vw,520px)] rounded-2xl bg-white border border-slate-200 shadow-xl">
+                <div className="px-4 pt-4">
+                  <h3 className="text-lg font-semibold">{type==='IN'? 'Stock IN' : 'Stock OUT'} — <span className="text-slate-500">{product.sku}</span></h3>
+                  <p className="text-sm text-slate-500 -mt-0.5">{product.name}</p>
+                </div>
+                <div className="p-4 grid grid-cols-2 gap-3">
+                  <Field label="Qty">
+                    <input ref={ref} type="number" min={1} value={qty} onChange={e=>setQty(e.target.value)} className="inp" />
+                  </Field>
+                  <Field label="Satuan">
+                    <input value={product.unit} disabled className="inp bg-slate-50" />
+                  </Field>
+                  <div className="col-span-2">
+                    <Field label="Catatan (opsional)">
+                      <input value={note} onChange={e=>setNote(e.target.value)} className="inp" placeholder="PO-009, retur, dll" />
+                    </Field>
+                  </div>
+                </div>
+                <div className="px-4 pb-4 flex justify-end gap-2">
+                  <button onClick={onClose} className="px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">Batal</button>
+                  <button onClick={()=>onSubmit(qty, note)} className={`px-4 py-2 rounded-xl text-white ${type==='IN'?'bg-emerald-600':'bg-amber-600'}`}>Simpan</button>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+
+        // ---- Reusable Modal Component ------------------------------
+        function Modal({ title, children, onConfirm, onCancel, confirmText, cancelText, type = 'confirm' }) {
+            return (
+              <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 grid place-items-center p-4" onMouseDown={onCancel}>
+                <div className="w-[min(96vw,480px)] rounded-2xl bg-white border border-slate-200 shadow-xl p-6 grid gap-4" onMouseDown={e => e.stopPropagation()}>
+                  <h3 className="text-xl font-semibold">{title}</h3>
+                  <div className="text-slate-600 text-sm max-h-[60vh] overflow-y-auto">{children}</div>
+                  <div className="flex justify-end items-center gap-3 mt-2">
+                    {type === 'confirm' && <button onClick={onCancel} className="px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-100">{cancelText || 'Batal'}</button>}
+                    <button onClick={onConfirm} className={`px-4 py-2 rounded-xl text-white ${type === 'confirm' ? 'bg-red-600 hover:bg-red-700' : 'bg-slate-900 hover:opacity-90'}`}>{confirmText || 'OK'}</button>
+                  </div>
+                </div>
+              </div>
+            );
+        }
+
+        // ---- Scanner Components (with Capture and Upload Feature) ------------------------------------
+        function BarcodeScanner({ onDetect }){
+          const videoRef = useRef(null);
+          const canvasRef = useRef(null);
+          const streamRef = useRef(null);
+          const fileInputRef = useRef(null);
+          
+          const [active, setActive] = useState(false);
+          const [isProcessing, setIsProcessing] = useState(false);
+          const [error, setError] = useState("");
+
+          // Cleanup function to stop the camera stream
+          const stopCamera = () => {
+              if (streamRef.current) {
+                  streamRef.current.getTracks().forEach(track => track.stop());
+              }
+              setActive(false);
+              setIsProcessing(false);
+              streamRef.current = null;
+          };
+
+          // Effect to run cleanup when the component is unmounted
+          useEffect(() => {
+            return () => {
+              stopCamera();
+            };
+          }, []);
+
+          // Function to start the camera
+          async function startCamera(){
+            setError("");
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                setError("Kamera tidak didukung di browser ini.");
+                return;
+            }
+            
+            try {
+              if (!window.ZXing) {
+                  throw new Error("Library pemindai (ZXing) gagal dimuat.");
+              }
+              const codeReader = new window.ZXing.BrowserCodeReader();
+              const videoInputDevices = await codeReader.listVideoInputDevices();
+              if (videoInputDevices.length === 0) {
+                  throw new Error("Tidak ada kamera yang ditemukan di perangkat ini.");
+              }
+              
+              const rearCamera = videoInputDevices.find(device => /back|rear|environment/i.test(device.label));
+              const selectedDeviceId = rearCamera ? rearCamera.deviceId : videoInputDevices[0].deviceId;
+              
+              const stream = await navigator.mediaDevices.getUserMedia({ 
+                  video: { deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined, facingMode: rearCamera ? 'environment' : 'user' } 
+              });
+              
+              if (videoRef.current) {
+                  videoRef.current.srcObject = stream;
+                  streamRef.current = stream;
+                  await videoRef.current.play();
+                  setActive(true);
+              }
+
+            } catch(e) {
+              console.error("Gagal memulai kamera:", e);
+              let friendlyError = "Gagal memulai kamera.";
+              if (e.name === "NotAllowedError") {
+                  friendlyError = "Izin akses kamera ditolak. Mohon izinkan akses kamera di pengaturan browser Anda.";
+              } else if (e.message.includes("not found")) {
+                  friendlyError = "Tidak ada kamera yang ditemukan.";
+              }
+              setError(friendlyError);
+              stopCamera();
+            }
+          }
+          
+          // Function to capture an image from the video stream and scan it
+          async function handleCaptureAndScan() {
+              if (!active || isProcessing || !videoRef.current || !canvasRef.current) return;
+              
+              setError("");
+              setIsProcessing(true);
+
+              const videoEl = videoRef.current;
+              const canvasEl = canvasRef.current;
+              
+              canvasEl.width = videoEl.videoWidth;
+              canvasEl.height = videoEl.videoHeight;
+              
+              const ctx = canvasEl.getContext('2d');
+              ctx.drawImage(videoEl, 0, 0, canvasEl.width, canvasEl.height);
+              
+              const image = new Image();
+              image.src = canvasEl.toDataURL('image/png');
+              image.onload = async () => {
+                  await scanImageElement(image, "jepretan");
+                  setIsProcessing(false);
+              };
+              image.onerror = () => {
+                  setError("Gagal memproses gambar jepretan.");
+                  setIsProcessing(false);
+              }
+          }
+          
+          // Function to handle scanning from an uploaded file
+          async function handleFileScan(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            setError("");
+            setIsProcessing(true);
+            
+            const imageUrl = URL.createObjectURL(file);
+            const image = new Image();
+            image.src = imageUrl;
+            
+            image.onload = async () => {
+                await scanImageElement(image, "gambar yang diunggah");
+                URL.revokeObjectURL(imageUrl);
+                setIsProcessing(false);
+            };
+
+            image.onerror = () => {
+                setError("Gagal memuat file gambar.");
+                setIsProcessing(false);
+                URL.revokeObjectURL(imageUrl);
+            };
+            
+            if(fileInputRef.current) {
+                fileInputRef.current.value = "";
+            }
+          }
+          
+          // Reusable function to scan any image-like element (canvas, img)
+          async function scanImageElement(element, sourceName) {
+              try {
+                  if (!window.ZXing) {
+                    throw new Error("Library pemindai (ZXing) gagal dimuat.");
+                  }
+                  const codeReader = new window.ZXing.BrowserMultiFormatReader();
+                  const result = await codeReader.decodeFromImageElement(element);
+                  
+                  if (result) {
+                      onDetect(result.getText());
+                      stopCamera(); // Success, so stop the camera
+                  }
+              } catch (err) {
+                  if (err instanceof window.ZXing.NotFoundException) {
+                      setError(`Barcode tidak terdeteksi dari ${sourceName}. Coba lagi.`);
+                  } else {
+                      console.error(`Kesalahan saat memindai ${sourceName}:`, err);
+                      setError(`Gagal memindai ${sourceName}. Silakan coba lagi.`);
+                  }
+              }
+          }
+
+          return (
+            <div className="grid gap-3">
+              <input
+                  type="file"
+                  ref={fileInputRef}
+                  className="hidden"
+                  accept="image/*"
+                  onChange={handleFileScan}
+              />
+              <div className="relative rounded-2xl border border-slate-200 overflow-hidden bg-black/5">
+                <video 
+                    ref={videoRef} 
+                    className={`w-full aspect-video object-cover ${active ? 'block' : 'hidden'}`} 
+                    muted 
+                    playsInline 
+                />
+                {!active && (
+                    <div className="w-full aspect-video grid place-content-center">
+                        <p className="text-slate-400">Kamera tidak aktif atau pilih unggah gambar</p>
+                    </div>
+                )}
+                <canvas ref={canvasRef} className="hidden" />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {!active ? (
+                  <>
+                    <button onClick={startCamera} className="px-3 py-2 rounded-xl bg-slate-900 text-white flex-1 sm:flex-none">
+                        Mulai Kamera
+                    </button>
+                    <button 
+                        onClick={() => fileInputRef.current.click()} 
+                        disabled={isProcessing}
+                        className="px-3 py-2 rounded-xl bg-white border border-slate-300 flex-1 sm:flex-none"
+                    >
+                        {isProcessing ? 'Memindai...' : 'Unggah Gambar'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button 
+                        onClick={handleCaptureAndScan} 
+                        disabled={isProcessing}
+                        className="px-3 py-2 rounded-xl bg-emerald-600 text-white disabled:opacity-50 disabled:cursor-wait flex items-center gap-2"
+                    >
+                        {isProcessing ? 'Memindai...' : 'Jepret & Pindai'}
+                    </button>
+                    <button onClick={stopCamera} className="px-3 py-2 rounded-xl border border-slate-300">Stop</button>
+                  </>
+                )}
+              </div>
+              {error && <div className="text-red-700 text-sm p-3 bg-red-50 rounded-xl border border-red-200">{error}</div>}
+            </div>
+          );
+        }
+
+        function ManualScan({ onSubmit }){
+          const [val, setVal] = useState("");
+          return (
+            <form className="grid gap-2" onSubmit={(e)=>{ e.preventDefault(); if(val.trim()) onSubmit(val.trim()); setVal(""); }}>
+              <div className="text-sm text-slate-500">Atau, input manual barcode/QR</div>
+              <div className="flex gap-2">
+                <input value={val} onChange={e=>setVal(e.target.value)} className="inp flex-1" placeholder="Ketik atau tempel hasil scan" />
+                <button type="submit" className="px-3 py-2 rounded-xl bg-white border border-slate-300">Pakai</button>
+              </div>
+            </form>
+          );
+        }
+
+        function SmallScanButton({ onValue }){
+          const [open, setOpen] = useState(false);
+          return (
+            <>
+              <button type="button" onClick={()=>setOpen(v=>!v)} className="px-3 py-2 rounded-xl border border-slate-300">Scan</button>
+              {open && (
+                <div className="fixed inset-0 bg-black/30 z-30 grid place-content-center p-4">
+                  <div className="w-[min(96vw,520px)] rounded-2xl bg-white border border-slate-200 shadow-xl p-4 grid gap-3">
+                    <div className="flex items-center justify-between">
+                      <div className="font-semibold">Scan Barcode</div>
+                      <button onClick={()=>setOpen(false)} className="px-3 py-1 rounded-lg border border-slate-300">Tutup</button>
+                    </div>
+                    <BarcodeScanner onDetect={(code)=>{ onValue(code); setOpen(false); }} />
+                  </div>
+                </div>
+              )}
+            </>
+          );
+        }
+
+        function ToggleGroup({ value, onChange }){
+          return (
+            <div className="inline-flex p-1 rounded-xl border border-slate-300 bg-white">
+              {(['OUT','IN']).map(opt => (
+                <button key={opt} onClick={()=>onChange(opt)} className={`px-3 py-1 rounded-lg text-sm ${value===opt? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'}`}>{opt}</button>
+              ))}
+            </div>
+          );
+        }
+
+        // ---- Reports ----------------------------------------------
+        function ReportCard({ txs, products, onExport, setModal }){
+          const [range, setRange] = useState('7'); // days
+          const [from, setFrom] = useState("");
+          const [to, setTo] = useState("");
+
+          const now = new Date();
+          const { start, end, label } = useMemo(()=>{
+            let s, e, label = '';
+            if (from && to){ s = new Date(from); e = new Date(to); label = `${from}_to_${to}`; }
+            else {
+              const d = Number(range);
+              e = now;
+              s = new Date(now.getTime() - d*24*60*60*1000);
+              label = `last_${d}_days`;
+            }
+            s.setHours(0,0,0,0); e.setHours(23,59,59,999);
+            return { start: s, end: e, label };
+          }, [range, from, to]);
+
+          const inRange = useMemo(()=> txs.filter(t => {
+            const dt = new Date(t.date);
+            return dt >= start && dt <= end;
+          }), [txs, start, end]);
+
+          const summary = useMemo(()=>{
+            const sums = { IN:0, OUT:0 };
+            for (const t of inRange){
+              sums[t.type] += t.qty;
+            }
+            const net = sums.IN - sums.OUT;
+            return { ...sums, NET: net };
+          }, [inRange]);
+
+          const byProduct = useMemo(()=>{
+            const map = new Map();
+            for (const t of inRange){
+              const key = t.productId;
+              const item = map.get(key) || { sku:t.sku, name:t.name, in:0, out:0 };
+              if (t.type==='IN') item.in += t.qty; else item.out += t.qty;
+              map.set(key, item);
+            }
+            const rows = Array.from(map.values()).map(r=>({ ...r, net: r.in - r.out }));
+            rows.sort((a,b)=> (Math.abs(b.out) + Math.abs(b.in)) - (Math.abs(a.out) + Math.abs(a.in)) );
+            return rows;
+          }, [inRange]);
+
+          const valuationNow = useMemo(()=> products.reduce((s,p)=>s+(p.stock||0)*(p.price||0),0), [products]);
+
+          return (
+            <Card>
+              <CardHeader title="Laporan Stok" subtitle="Ringkasan pergerakan stok & valuasi" />
+              <div className="p-4 grid gap-4">
+                <div className="flex flex-wrap gap-3 items-end">
+                  <div className="grid">
+                    <label className="text-xs text-slate-500">Rentang Cepat</label>
+                    <select value={range} onChange={e=>{setRange(e.target.value); setFrom(''); setTo('');}} className="px-3 py-2 rounded-xl border border-slate-300">
+                      <option value="7">7 hari terakhir</option>
+                      <option value="14">14 hari terakhir</option>
+                      <option value="30">30 hari terakhir</option>
+                      <option value="90">90 hari terakhir</option>
+                    </select>
+                  </div>
+                  <div className="grid">
+                    <label className="text-xs text-slate-500">Dari (YYYY-MM-DD)</label>
+                    <input type="date" value={from} onChange={e=>setFrom(e.target.value)} className="inp" />
+                  </div>
+                  <div className="grid">
+                    <label className="text-xs text-slate-500">Sampai</label>
+                    <input type="date" value={to} onChange={e=>setTo(e.target.value)} className="inp" />
+                  </div>
+                  <div className="ml-auto flex gap-2">
+                    <button onClick={()=>onExport(label, inRange)} disabled={inRange.length === 0} className="px-3 py-2 text-sm rounded-xl bg-white border border-slate-300 disabled:opacity-50">Ekspor Rentang (CSV)</button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <Stat label="IN (unit)" value={fmt.format(summary.IN)} />
+                  <Stat label="OUT (unit)" value={fmt.format(summary.OUT)} />
+                  <Stat label="NET (unit)" value={fmt.format(summary.NET)} />
+                  <Stat label="Valuasi Saat Ini" value={money(valuationNow)} />
+                </div>
+
+                <div className="rounded-xl border border-slate-200 overflow-auto">
+                  <h3 className="text-base font-semibold p-4">Pergerakan Teratas</h3>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-slate-500 bg-slate-50">
+                        <th className="p-2 font-medium">SKU</th>
+                        <th className="p-2 font-medium">Nama</th>
+                        <th className="p-2 font-medium text-right">IN</th>
+                        <th className="p-2 font-medium text-right">OUT</th>
+                        <th className="p-2 font-medium text-right">NET</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {byProduct.length===0 && <tr><td colSpan={5} className="py-8 text-center text-slate-500">Tidak ada pergerakan pada periode ini</td></tr>}
+                      {byProduct.map((r,i)=> (
+                        <tr key={i} className="border-t border-slate-100">
+                          <td className="p-2 font-mono">{r.sku}</td>
+                          <td className="p-2">{r.name}</td>
+                          <td className="p-2 text-right">{fmt.format(r.in)}</td>
+                          <td className="p-2 text-right">{fmt.format(r.out)}</td>
+                          <td className={`p-2 text-right font-medium ${r.net<0?'text-amber-700': r.net>0?'text-emerald-700':'text-slate-700'}`}>{fmt.format(r.net)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <LowStockReport products={products} />
+              </div>
+            </Card>
+          );
+        }
+
+        function LowStockReport({ products }) {
+            const lowStockItems = useMemo(() => products.filter(p => p.stock <= (p.minStock || 0)).sort((a,b) => (a.stock - a.minStock) - (b.stock - b.minStock)), [products]);
+            
+            if (lowStockItems.length === 0) {
+                return null;
+            }
+
+            return (
+                <div className="mt-4">
+                    <h3 className="text-base font-semibold p-4">Analisis Stok Rendah</h3>
+                    <div className="rounded-xl border border-slate-200 overflow-auto">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className="text-left text-slate-500 bg-slate-50">
+                                    <th className="p-2 font-medium">SKU</th>
+                                    <th className="p-2 font-medium">Nama</th>
+                                    <th className="p-2 font-medium text-right">Stok / Min</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {lowStockItems.map(p => (
+                                    <tr key={p.id} className="border-t border-slate-100 bg-red-50/40">
+                                        <td className="p-2 font-mono">{p.sku}</td>
+                                        <td className="p-2">{p.name}</td>
+                                        <td className="p-2 text-right font-medium">{p.stock} / {p.minStock}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        }
+
+        // ---- Mount the App to the DOM --------------------------
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
